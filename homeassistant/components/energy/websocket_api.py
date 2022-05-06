@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+
+# from asyncio.log import logger
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -50,6 +52,7 @@ def async_setup(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_validate)
     websocket_api.async_register_command(hass, ws_solar_forecast)
     websocket_api.async_register_command(hass, ws_get_fossil_energy_consumption)
+    websocket_api.async_register_command(hass, ws_get_carbon_dioxide_equivalent)
 
 
 @singleton("energy_platforms")
@@ -226,6 +229,66 @@ async def ws_solar_forecast(
     connection.send_result(msg["id"], forecasts)
 
 
+# Helper functions for fossil energy and emissions
+def _combine_sum_statistics(
+    stats: dict[str, list[dict[str, Any]]], statistic_ids: list[str]
+) -> dict[datetime, float]:
+    """Combine multiple statistics, returns a dict indexed by start time."""
+    result: defaultdict[datetime, float] = defaultdict(float)
+
+    for statistics_id, stat in stats.items():
+        if statistics_id not in statistic_ids:
+            continue
+        for period in stat:
+            if period["sum"] is None:
+                continue
+            result[period["start"]] += period["sum"]
+
+    return {key: result[key] for key in sorted(result)}
+
+
+def _calculate_deltas(sums: dict[datetime, float]) -> dict[datetime, float]:
+    prev: float | None = None
+    result: dict[datetime, float] = {}
+    for period, sum_ in sums.items():
+        if prev is not None:
+            result[period] = sum_ - prev
+        prev = sum_
+    return result
+
+
+def _reduce_deltas(
+    stat_list: list[dict[str, Any]],
+    same_period: Callable[[datetime, datetime], bool],
+    period_start_end: Callable[[datetime], tuple[datetime, datetime]],
+    period: timedelta,
+) -> list[dict[str, Any]]:
+    """Reduce hourly deltas to daily or monthly deltas."""
+    result: list[dict[str, Any]] = []
+    deltas: list[float] = []
+    if not stat_list:
+        return result
+    prev_stat: dict[str, Any] = stat_list[0]
+
+    # Loop over the hourly deltas + a fake entry to end the period
+    for statistic in chain(stat_list, ({"start": stat_list[-1]["start"] + period},)):
+        if not same_period(prev_stat["start"], statistic["start"]):
+            start, _ = period_start_end(prev_stat["start"])
+            # The previous statistic was the last entry of the period
+            result.append(
+                {
+                    "start": start.isoformat(),
+                    "delta": sum(deltas),
+                }
+            )
+            deltas = []
+        if statistic.get("delta") is not None:
+            deltas.append(statistic["delta"])
+        prev_stat = statistic
+
+    return result
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "energy/fossil_energy_consumption",
@@ -233,6 +296,7 @@ async def ws_solar_forecast(
         vol.Required("end_time"): str,
         vol.Required("energy_statistic_ids"): [str],
         vol.Required("co2_statistic_id"): str,
+        vol.Required("co2_offset_factor"): vol.Coerce(float),
         vol.Required("period"): vol.Any("5minute", "hour", "day", "month"),
     }
 )
@@ -243,6 +307,8 @@ async def ws_get_fossil_energy_consumption(
     """Calculate amount of fossil based energy."""
     start_time_str = msg["start_time"]
     end_time_str = msg["end_time"]
+
+    co2_offset_factor = msg["co2_offset_factor"]
 
     if start_time := dt_util.parse_datetime(start_time_str):
         start_time = dt_util.as_utc(start_time)
@@ -270,64 +336,6 @@ async def ws_get_fossil_energy_consumption(
         True,
     )
 
-    def _combine_sum_statistics(
-        stats: dict[str, list[dict[str, Any]]], statistic_ids: list[str]
-    ) -> dict[datetime, float]:
-        """Combine multiple statistics, returns a dict indexed by start time."""
-        result: defaultdict[datetime, float] = defaultdict(float)
-
-        for statistics_id, stat in stats.items():
-            if statistics_id not in statistic_ids:
-                continue
-            for period in stat:
-                if period["sum"] is None:
-                    continue
-                result[period["start"]] += period["sum"]
-
-        return {key: result[key] for key in sorted(result)}
-
-    def _calculate_deltas(sums: dict[datetime, float]) -> dict[datetime, float]:
-        prev: float | None = None
-        result: dict[datetime, float] = {}
-        for period, sum_ in sums.items():
-            if prev is not None:
-                result[period] = sum_ - prev
-            prev = sum_
-        return result
-
-    def _reduce_deltas(
-        stat_list: list[dict[str, Any]],
-        same_period: Callable[[datetime, datetime], bool],
-        period_start_end: Callable[[datetime], tuple[datetime, datetime]],
-        period: timedelta,
-    ) -> list[dict[str, Any]]:
-        """Reduce hourly deltas to daily or monthly deltas."""
-        result: list[dict[str, Any]] = []
-        deltas: list[float] = []
-        if not stat_list:
-            return result
-        prev_stat: dict[str, Any] = stat_list[0]
-
-        # Loop over the hourly deltas + a fake entry to end the period
-        for statistic in chain(
-            stat_list, ({"start": stat_list[-1]["start"] + period},)
-        ):
-            if not same_period(prev_stat["start"], statistic["start"]):
-                start, _ = period_start_end(prev_stat["start"])
-                # The previous statistic was the last entry of the period
-                result.append(
-                    {
-                        "start": start.isoformat(),
-                        "delta": sum(deltas),
-                    }
-                )
-                deltas = []
-            if statistic.get("delta") is not None:
-                deltas.append(statistic["delta"])
-            prev_stat = statistic
-
-        return result
-
     merged_energy_statistics = _combine_sum_statistics(
         statistics, msg["energy_statistic_ids"]
     )
@@ -337,9 +345,16 @@ async def ws_get_fossil_energy_consumption(
         for period in statistics.get(msg["co2_statistic_id"], {})
     }
 
-    # Calculate amount of fossil based energy, assume 100% fossil if missing
+    # Calculate amount of fossil based energy (statistic is percent of energy using fossil), assume 100% fossil if missing
+    # Depends on a factor of the amount that is offset by GreenPower
     fossil_energy = [
-        {"start": start, "delta": delta * indexed_co2_statistics.get(start, 100) / 100}
+        {
+            "start": start,
+            "delta": delta
+            * indexed_co2_statistics.get(start, 100)
+            * (1.0 - co2_offset_factor)
+            / 100,
+        }
         for start, delta in energy_deltas.items()
     ]
 
@@ -348,7 +363,6 @@ async def ws_get_fossil_energy_consumption(
             {"start": period["start"].isoformat(), "delta": period["delta"]}
             for period in fossil_energy
         ]
-
     elif msg["period"] == "day":
         reduced_fossil_energy = _reduce_deltas(
             fossil_energy,
@@ -365,4 +379,103 @@ async def ws_get_fossil_energy_consumption(
         )
 
     result = {period["start"]: period["delta"] for period in reduced_fossil_energy}
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "energy/carbon_dioxide_equivalent",
+        vol.Required("start_time"): str,
+        vol.Required("end_time"): str,
+        vol.Required("energy_statistic_ids"): [str],
+        vol.Required("co2_statistic_id"): str,
+        vol.Required("co2_intensity_default"): vol.Coerce(float),
+        vol.Required("co2_offset_factor"): vol.Coerce(float),
+        vol.Required("period"): vol.Any("5minute", "hour", "day", "month"),
+    }
+)
+@websocket_api.async_response
+async def ws_get_carbon_dioxide_equivalent(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Calculate amount of fossil based energy."""
+    start_time_str = msg["start_time"]
+    end_time_str = msg["end_time"]
+
+    co2_offset_factor = msg["co2_offset_factor"]
+    co2_intensity_default = msg["co2_intensity_default"]
+
+    # logger.info("Started ws_get_carbon_dioxide_equivalent" + " - type: " + msg["type"])
+
+    if start_time := dt_util.parse_datetime(start_time_str):
+        start_time = dt_util.as_utc(start_time)
+    else:
+        connection.send_error(msg["id"], "invalid_start_time", "Invalid start_time")
+        return
+
+    if end_time := dt_util.parse_datetime(end_time_str):
+        end_time = dt_util.as_utc(end_time)
+    else:
+        connection.send_error(msg["id"], "invalid_end_time", "Invalid end_time")
+        return
+
+    statistic_ids = list(msg["energy_statistic_ids"])
+    statistic_ids.append(msg["co2_statistic_id"])
+
+    # Fetch energy + CO2 statistics
+    statistics = await recorder.get_instance(hass).async_add_executor_job(
+        recorder.statistics.statistics_during_period,
+        hass,
+        start_time,
+        end_time,
+        statistic_ids,
+        "hour",
+        True,
+    )
+
+    merged_energy_statistics = _combine_sum_statistics(
+        statistics, msg["energy_statistic_ids"]
+    )
+    energy_deltas = _calculate_deltas(merged_energy_statistics)
+    indexed_co2_statistics = {
+        period["start"]: period["mean"]
+        for period in statistics.get(msg["co2_statistic_id"], {})
+    }
+
+    # Calculate amount of emissions (kgCO2eq)
+    # The CO2 stat is the intensity (gCO2eq per kWh) assume a default if intensity is missing
+    # We apply a factor on the grid for "greenpower imports" where only green is purchased (even though the grid is a mix)
+    co2_emissions = [
+        {
+            "start": start,
+            "delta": delta
+            * indexed_co2_statistics.get(start, co2_intensity_default)
+            / 1000
+            * co2_offset_factor,
+        }
+        for start, delta in energy_deltas.items()
+    ]
+
+    if msg["period"] == "hour":
+        reduced_co2_emissions = [
+            {"start": period["start"].isoformat(), "delta": period["delta"]}
+            for period in co2_emissions
+        ]
+
+    elif msg["period"] == "day":
+        reduced_co2_emissions = _reduce_deltas(
+            co2_emissions,
+            recorder.statistics.same_day,
+            recorder.statistics.day_start_end,
+            timedelta(days=1),
+        )
+    else:
+        reduced_co2_emissions = _reduce_deltas(
+            co2_emissions,
+            recorder.statistics.same_month,
+            recorder.statistics.month_start_end,
+            timedelta(days=1),
+        )
+
+    result = {period["start"]: period["delta"] for period in reduced_co2_emissions}
     connection.send_result(msg["id"], result)
